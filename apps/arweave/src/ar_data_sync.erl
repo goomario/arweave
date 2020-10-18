@@ -151,8 +151,9 @@ init([]) ->
 					end,
 					RawDiskPoolDataRoots
 				),
-				{StoredSyncRecord, StoredRecentBI, StoredDiskPoolDataRoots, StoredDiskPoolSize,
-					element(2, hd(StoredRecentBI))};
+				WS = case StoredRecentBI of [] -> 0; _ -> element(2, hd(StoredRecentBI)) end,
+				{StoredSyncRecord,
+					StoredRecentBI, StoredDiskPoolDataRoots, StoredDiskPoolSize, WS};
 			not_found ->
 				{ar_intervals:new(), [], #{}, 0, 0}
 		end,
@@ -163,10 +164,12 @@ init([]) ->
 		weave_size = WeaveSize,
 		disk_pool_data_roots = DiskPoolDataRoots,
 		disk_pool_size = DiskPoolSize,
-		disk_pool_cursor = first
+		disk_pool_cursor = first,
+		missing_data_cursor = first
 	},
 	gen_server:cast(self(), update_peer_sync_records),
 	gen_server:cast(self(), {sync_random_interval, []}),
+	gen_server:cast(self(), compact_intervals),
 	gen_server:cast(self(), update_disk_pool_data_roots),
 	gen_server:cast(self(), process_disk_pool_item),
 	{ok, State2}.
@@ -351,26 +354,100 @@ handle_cast({sync_random_interval, RecentlyFailedPeers}, State) ->
 	#sync_data_state{
 		sync_record = SyncRecord,
 		weave_size = WeaveSize,
-		peer_sync_records = PeerSyncRecords
+		peer_sync_records = PeerSyncRecords,
+		missing_data_cursor = Cursor,
+		missing_chunks_index = MissingChunksIndex
 	} = State,
 	FilteredPeerSyncRecords = maps:without(RecentlyFailedPeers, PeerSyncRecords),
 	case get_random_interval(SyncRecord, FilteredPeerSyncRecords, WeaveSize) of
 		none ->
-			timer:apply_after(
-				?PAUSE_AFTER_COULD_NOT_FIND_CHUNK_MS,
-				gen_server,
-				cast,
-				[self(), {sync_random_interval, []}]
-			),
-			{noreply, State};
+			case ar_kv:cyclic_iterator_move(MissingChunksIndex, Cursor) of
+				none ->
+					timer:apply_after(
+						?SCAN_MISSING_CHUNKS_INDEX_FREQUENCY_MS,
+						gen_server,
+						cast,
+						[self(), {sync_random_interval, []}]
+					),
+					{noreply, State#sync_data_state{ missing_data_cursor = first }};
+				{ok, _Key, Value, _NextCursor} ->
+					<< Start:?OFFSET_KEY_BITSIZE >> = Value,
+					Byte =
+						case Cursor of
+							first ->
+								Start + 1;
+							_ ->
+								<< Offset:?OFFSET_KEY_BITSIZE >> = Cursor,
+								max(Offset, Start) + 1
+						end,
+					case get_peer_with_byte(Byte, FilteredPeerSyncRecords) of
+						not_found ->
+							timer:apply_after(
+								?SCAN_MISSING_CHUNKS_INDEX_FREQUENCY_MS,
+								gen_server,
+								cast,
+								[self(), sync_random_interval]
+							);
+						{ok, Peer} ->
+							%% Sync one chunk.
+							L = Byte - 1,
+							R = Byte,
+							gen_server:cast(self(), {sync_chunk, Peer, L, R})
+					end,
+					NextCursor = << (Byte + ?DATA_CHUNK_SIZE div 2):?OFFSET_KEY_BITSIZE >>,
+					%% Do not remove recently failed peers from the state as
+					%% we are very likely to hit the false positives at this point.
+					{noreply, State#sync_data_state{ missing_data_cursor = NextCursor }}
+			end;
 		{ok, {Peer, LeftBound, RightBound}} ->
 			gen_server:cast(self(), {sync_chunk, Peer, LeftBound, RightBound}),
 			{noreply, State#sync_data_state{ peer_sync_records = FilteredPeerSyncRecords }}
 	end;
 
+%% Keep the number of intervals below ?MAX_SHARED_SYNCED_INTERVALS_COUNT,
+%% possibly introducing false positives. Over time, the number of intervals that
+%% cannot be synced grows because some data is never uploaded, be it by mistake
+%% or on purpose. When the number of intervals exceeds ?MAX_SHARED_SYNCED_INTERVALS_COUNT,
+%% join the neighboring intervals together, starting from the intervals at the smallest
+%% distance apart from each other. The false positives added this way are synced after no
+%% byte that is not in our sync record is found in any of the peers' sync records.
+%% The process then starts scanning the missing chunks index looking for the missing data.
+handle_cast(compact_intervals, State) ->
+	#sync_data_state{
+		sync_record = SyncRecord,
+		missing_data_cursor = Cursor,
+		missing_chunks_index = MissingChunksIndex
+	} = State,
+	{Compacted, UpdatedSyncRecord} =
+		ar_intervals:compact(SyncRecord, ?MAX_SHARED_SYNCED_INTERVALS_COUNT),
+	lists:foreach(
+		fun({End, Start}) ->
+			ok = ar_kv:put(
+				MissingChunksIndex,
+				<< End:?OFFSET_KEY_BITSIZE >>,
+				<< Start:?OFFSET_KEY_BITSIZE >>
+			)
+		end,
+		Compacted
+	),
+	NextCursor =
+		case Compacted of
+			[] ->
+				Cursor;
+			[{_End, Start} | _] ->
+				%% Point the missing data cursor at the start of the biggest removed
+				%% interval so that we try to sync it first after we cannot find anything
+				%% to sync that is not in our sync record (with false positives).
+				<< (Start + 1):?OFFSET_KEY_BITSIZE >>
+		end,
+	{noreply, State#sync_data_state{
+		sync_record = UpdatedSyncRecord,
+		missing_data_cursor = NextCursor
+	}};
+
 handle_cast({sync_chunk, _, LeftBound, RightBound}, State) when LeftBound >= RightBound ->
 	gen_server:cast(self(), {sync_random_interval, []}),
-	ok = store_sync_state(State),
+	record_v2_index_data_size(State),
 	{noreply, State};
 handle_cast({sync_chunk, Peer, LeftBound, RightBound}, State) ->
 	Self = self(),
@@ -605,6 +682,7 @@ handle_info(_Message, State) ->
 terminate(Reason, State) ->
 	#sync_data_state{ chunks_index = {DB, _} } = State,
 	ar:info([{event, ar_data_sync_terminate}, {reason, Reason}]),
+	ok = store_sync_state(State),
 	ar_kv:close(DB).
 
 %%%===================================================================
@@ -622,6 +700,7 @@ init_kv() ->
 	ColumnFamilies = [
 		"default",
 		"chunks_index",
+		"missing_chunks_index",
 		"data_root_index",
 		"data_root_offset_index",
 		"tx_index",
@@ -640,15 +719,16 @@ init_kv() ->
 		_ ->
 			do_not_attempt_to_repair
 	end,
-	{ok, DB, [_, CF1, CF2, CF3, CF4, CF5, CF6]} =
+	{ok, DB, [_, CF1, CF2, CF3, CF4, CF5, CF6, CF7]} =
 		ar_kv:open("ar_data_sync_db", ColumnFamilyDescriptors),
 	State = #sync_data_state{
 		chunks_index = {DB, CF1},
-		data_root_index = {DB, CF2},
-		data_root_offset_index = {DB, CF3},
-		tx_index = {DB, CF4},
-		tx_offset_index = {DB, CF5},
-		disk_pool_chunks_index = {DB, CF6}
+		missing_chunks_index = {DB, CF2},
+		data_root_index = {DB, CF3},
+		data_root_offset_index = {DB, CF4},
+		tx_index = {DB, CF5},
+		tx_offset_index = {DB, CF6},
+		disk_pool_chunks_index = {DB, CF7}
 	},
 	ets:new(?MODULE, [set, named_table, {read_concurrency, true}]),
 	ets:insert(?MODULE, {chunks_index, {DB, CF1}}),
@@ -962,10 +1042,18 @@ update_chunks_index(
 	TXPath,
 	ChunkSize
 ) ->
-	case ar_intervals:is_inside(SyncRecord, AbsoluteChunkOffset) of
-		true ->
-			not_updated;
+	Key = << AbsoluteChunkOffset:?OFFSET_KEY_BITSIZE >>,
+	%% The check is inversed to account for false positives possibly present
+	%% in the sync record. Checking the sync record saves us one extra disk
+	%% read per new chunk not present in the sync record (most of the chunks
+	%% should be like this).
+	ChunkNotStored =
+		not ar_intervals:is_inside(SyncRecord, AbsoluteChunkOffset)
+			orelse ar_kv:get(ChunksIndex, Key) == not_found,
+	case ChunkNotStored of
 		false ->
+			not_updated;
+		true ->
 			Value = {DataPathHash, TXRoot, DataRoot, TXPath, ChunkOffset, ChunkSize},
 			Key = << AbsoluteChunkOffset:?OFFSET_KEY_BITSIZE >>,
 			case ar_kv:put(ChunksIndex, Key, term_to_binary(Value)) of
@@ -991,7 +1079,17 @@ update_chunks_index(
 							do_not_update_disk_pool
 					end,
 					StartOffset = AbsoluteChunkOffset - ChunkSize,
-					{ok, ar_intervals:add(SyncRecord, AbsoluteChunkOffset, StartOffset)};
+					SyncRecord2 = ar_intervals:add(SyncRecord, AbsoluteChunkOffset, StartOffset),
+					MaxSharedIntervals = ?MAX_SHARED_SYNCED_INTERVALS_COUNT,
+					ExtraIntervalsBeforeCompaction = ?EXTRA_INTERVALS_BEFORE_COMPACTION,
+					Count = ar_intervals:count(SyncRecord2),
+					case Count > MaxSharedIntervals + ExtraIntervalsBeforeCompaction of
+						true ->
+							gen_server:cast(self(), compact_intervals);
+						false ->
+							ok
+					end,
+					{ok, SyncRecord2};
 				{error, Reason} ->
 					ar:err([
 						{event, failed_to_update_chunk_index},
@@ -1009,9 +1107,11 @@ store_sync_state(
 		block_index = BI
 	}
 ) ->
-	prometheus_gauge:set(v2_index_data_size, ar_intervals:sum(SyncRecord)),
 	ar_metrics:store(disk_pool_chunks_count),
 	ar_storage:write_term(data_sync_state, {SyncRecord, BI, DiskPoolDataRoots, DiskPoolSize}).
+
+record_v2_index_data_size(#sync_data_state{ sync_record = SyncRecord }) ->
+	prometheus_gauge:set(v2_index_data_size, ar_intervals:sum(SyncRecord)).
 
 pick_random_peers(Peers, N, M) ->
 	lists:sublist(
@@ -1041,12 +1141,28 @@ get_random_interval(SyncRecord, PeerSyncRecords, WeaveSize) ->
 						{L, Byte, R} =
 							ar_intervals:get_interval_by_nth_inner_number(I, RelativeByte),
 						LeftBound = max(L, Byte - SyncSize div 2),
-						{ok, {Peer, LeftBound, min(R, LeftBound + SyncSize div 2)}}
+						{ok, {Peer, LeftBound, min(R, LeftBound + SyncSize)}}
 				end
 		end,
 		none,
 		PeerSyncRecords
 	).
+
+get_peer_with_byte(Byte, PeerSyncRecords) ->
+	get_peer_with_byte2(Byte, maps:iterator(PeerSyncRecords)).
+
+get_peer_with_byte2(Byte, PeerSyncRecordsIterator) ->
+	case maps:next(PeerSyncRecordsIterator) of
+		none ->
+			not_found;
+		{Peer, SyncRecord, PeerSyncRecordsIterator2} ->
+			case ar_intervals:is_inside(SyncRecord, Byte) of
+				true ->
+					{ok, Peer};
+				false ->
+					get_peer_with_byte2(Byte, PeerSyncRecordsIterator2)
+			end
+	end.
 
 validate_proof(_, _, _, _, Chunk, _) when byte_size(Chunk) > ?DATA_CHUNK_SIZE ->
 	false;
@@ -1186,7 +1302,7 @@ store_chunk(State, DataRootIndexIterator, DataRoot, DataPath, Chunk, EndOffset, 
 				TXSize
 			) of
 				{updated, UpdatedState} ->
-					ok = store_sync_state(UpdatedState),
+					record_v2_index_data_size(UpdatedState),
 					store_chunk(
 						UpdatedState,
 						UpdatedDataRootIndexIterator,
@@ -1349,7 +1465,7 @@ process_disk_pool_item(State, Key, Value, NextCursor) ->
 			UpdatedState = case IsUpdated of
 				updated ->
 					U = State#sync_data_state{ sync_record = UpdatedSyncRecord },
-					ok = store_sync_state(U),
+					record_v2_index_data_size(U),
 					U;
 				not_updated ->
 					State
