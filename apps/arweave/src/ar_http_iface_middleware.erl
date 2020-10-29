@@ -1695,9 +1695,9 @@ search_in_block_index(H, BI) ->
 	end.
 
 %% @doc Find a block, given a type and a specifier.
-find_block(<<"height">>, RawHeight) ->
-	BI = ar_node:get_block_index(whereis(http_entrypoint_node)),
-	ar_storage:read_block(binary_to_integer(RawHeight), BI);
+find_block(<<"height">>, RawHeight) when is_integer(RawHeight) ->
+    BI = ar_node:get_block_index(whereis(http_entrypoint_node)),
+    ar_storage:read_block(RawHeight, BI);
 find_block(<<"hash">>, ID) ->
 	ar_storage:read_block(ID).
 
