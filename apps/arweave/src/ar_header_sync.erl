@@ -138,12 +138,10 @@ handle_cast(check_space_alarm, State) ->
 				"There is only ~s of space left. When it is less than ~s, the node"
 				" will remove some of the old block and transaction headers -"
 				" consider adding some disk space.",
-			ar:console(
-				io_lib:format(Msg, [
-					ar_util:bytes_to_mb_string(FreeSpace),
-					ar_util:bytes_to_mb_string(?DISK_HEADERS_BUFFER_SIZE)
-				])
-			);
+			ar:console(Msg, [
+				ar_util:bytes_to_mb_string(FreeSpace),
+				ar_util:bytes_to_mb_string(?DISK_HEADERS_BUFFER_SIZE)
+			]);
 		false ->
 			ok
 	end,
